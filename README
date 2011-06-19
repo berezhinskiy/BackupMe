@@ -1,0 +1,12 @@
+About:
+- Flexible utility for backup databases and file system
+
+Features:
+- Use any archiver: tar, rar, zip, 7z etc.
+- Works with storages: Local folder, FTP and SCP
+- Supports database: MySQL, PostgreSQL
+- Easy and flexibile XML configuration file
+- Supports the use of macros in the configuration file: @year, @month, @day
+- Great logging [file|syslog] system with severity level: DEBUG, INFO, WARN, ERROR, OFF
+- Checking free disk space before start backups
+- Reporting: Mail, Jabber
