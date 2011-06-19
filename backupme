@@ -9,7 +9,7 @@
 # ** can be used with different types of archiveres;
 # ** send backuped files using FTP or SCP protocol;
 # ** backup MySQL and PostgreSQL databases;
-# ** generate and send report via email or\and jabber.
+# ** generate and send report via email.
 #
 # INSTALLATION AND USAGE:
 # Full installation and usage BackupMe instructions you can find
@@ -36,7 +36,6 @@ use Mail::Sendmail;
 use Net::FTP;
 use Net::SCP::Expect;
 use Net::SSH qw(ssh_cmd);
-use Net::Jabber;
 use locale;
 use POSIX qw (locale_h);
 
@@ -89,23 +88,10 @@ sub InitConfig {
     $mail_report{port} = $xml->{General}->{MailReport}->{port};
     $mail_report{subject} = $xml->{General}->{MailReport}->{subject};
 
-    my %jabber_report;
-    $jabber_report{use} = $xml->{General}->{JabberReport}->{use};
-    if ($jabber_report{use} ne "true" and $jabber_report{use} ne "false"){
-        Log("warn","Unknow JabberReport option use=\"$jabber_report{use}\" Possible value: [true|false] Jabber use was set to default value: false",\%log);
-        $jabber_report{use} = "false";
-    }
-    $jabber_report{from} = $xml->{General}->{JabberReport}->{from};
-
-    $jabber_report{to} = $xml->{General}->{JabberReport}->{to};
-    $jabber_report{host} = $xml->{General}->{JabberReport}->{host};
-    $jabber_report{port} = $xml->{General}->{JabberReport}->{port};
-    $jabber_report{password} = $xml->{General}->{JabberReport}->{password};
-
     my $temp_dir = $xml->{Repositories}->{TempDir}->{path};
 
 
-    return(\%log,\%mail_report,\%jabber_report,$archivers,$directory,$storages,$mysql,\%mysql_dump,$pgsql,\%pgsql_dump,$temp_dir);
+    return(\%log,\%mail_report,$archivers,$directory,$storages,$mysql,\%mysql_dump,$pgsql,\%pgsql_dump,$temp_dir);
 }
 
 sub Log {
@@ -572,42 +558,6 @@ END_OF_BODY
     return($collector_pgsql);
 }
 
-sub SendJabber {
-    my $jabber_report = shift;
-    my $mail = shift;
-    my $log = shift;
-    if ( $jabber_report->{use} eq "false" ){
-        Log("debug","Jabber notification was not send, because JabberReport use key set to: \"$jabber_report->{use}\"",$log);
-        return;
-    }
-    Log("debug","\tSending Jabber notification",$log);
-    my $date = GetDate();
-    my $hostname = hostname;
-    my $connection = Net::Jabber::Client->new();
-
-    eval { $connection->Connect( "hostname" => "$jabber_report->{host}","port" => "$jabber_report->{port}" ) };
-    if ( $@ ){
-        Log("error","Can't connect to xmpp://$jabber_report->{host}:$jabber_report->{port} :: $@",$log);
-        return;
-    }
-
-    Log("debug","\t  Successfull connection to xmpp://$jabber_report->{host}:$jabber_report->{port}",$log);
-    my @result = $connection->AuthSend( "username" => "$jabber_report->{from}","password" => "$jabber_report->{password}","resource" => "backupme");
-    if ($result[0] ne "ok") {
-        Log("error","Ident/Auth with jabber server xmpp://$jabber_report->{host}:$jabber_report->{port} failed :: $result[1]",$log);
-        return;
-    }
-    Log("debug","\t  Successfull login to xmpp://$jabber_report->{host} with jid $jabber_report->{from}"."@"."$jabber_report->{host}",$log);
-    my $message = Net::Jabber::Message->new();
-    $message->SetMessage( "to"           => "$jabber_report->{to}"."@"."$jabber_report->{host}",
-                        "subject"      => "Backup Report",
-                        "type"         => "normal",
-                        "body"         => "Backup report for $date->{year}-$date->{month}-$date->{day} in $hostname\n\n$mail");
-    $connection->Send($message);
-    $connection->Disconnect();
-    Log("info","Jabber notification successfully sent to $jabber_report->{to}"."@"."$jabber_report->{host}",$log);
-}
-
 sub SendMail {
     my $mail_report = shift;
     my $collector = shift;
@@ -647,7 +597,7 @@ sub SendMail {
 
 
 sub StartBackupDirectories {
-    my ($log,$mail_report,$jabber_report,$archivers,$directories,$storages,$temp_dir) = @_;
+    my ($log,$mail_report,$archivers,$directories,$storages,$temp_dir) = @_;
     if ($directories->{empty}){return;}
     my ($collector_type,$collector_directories);
 
@@ -747,7 +697,7 @@ sub StartBackupDirectories {
 }
 
 sub StartBackupMySQL {
-    my ($log,$mail_report,$jabber_report,$storages,$mysql,$mysqldump,$temp_dir) = @_;
+    my ($log,$mail_report,$storages,$mysql,$mysqldump,$temp_dir) = @_;
     if ($mysql->{empty}){return;}
     my ($collector_type,$collector_mysql);
     foreach my $mysql_name (sort keys %$mysql){
@@ -820,7 +770,7 @@ sub StartBackupMySQL {
 }
 
 sub StartBackupPostgreSQL {
-    my ($log,$mail_report,$jabber_report,$storages,$pgsql,$pgsqldump,$temp_dir) = @_;
+    my ($log,$mail_report,$storages,$pgsql,$pgsqldump,$temp_dir) = @_;
     if ($pgsql->{empty}){return;}
     my ($collector_type,$collector_pgsql);
     foreach my $pgsql_name (sort keys %$pgsql){
@@ -906,12 +856,12 @@ if (defined($ARGV[1]) and $ARGV[0] eq "-c"){
     }
 }
 
-my ($log,$mail_report,$jabber_report,$archivers,$directories,$storages,$mysql,$mysqldump,$pgsql,$pgsqldump,$temp_dir)=InitConfig($config);
+my ($log,$mail_report,$archivers,$directories,$storages,$mysql,$mysqldump,$pgsql,$pgsqldump,$temp_dir)=InitConfig($config);
 Log("info","Start script $0 Use $config as configuration file",$log);
 
-my $collector_directories = StartBackupDirectories($log,$mail_report,$jabber_report,$archivers,$directories,$storages,$temp_dir);
-my $collector_mysql = StartBackupMySQL($log,$mail_report,$jabber_report,$storages,$mysql,$mysqldump,$temp_dir);
-my $collector_pgsql = StartBackupPostgreSQL($log,$mail_report,$jabber_report,$storages,$pgsql,$pgsqldump,$temp_dir);
+my $collector_directories = StartBackupDirectories($log,$mail_report,$archivers,$directories,$storages,$temp_dir);
+my $collector_mysql = StartBackupMySQL($log,$mail_report,$storages,$mysql,$mysqldump,$temp_dir);
+my $collector_pgsql = StartBackupPostgreSQL($log,$mail_report,$storages,$pgsql,$pgsqldump,$temp_dir);
 
 my $time_script_end = time();
 my $time = GetHumanTime($time_script_end - $time_script_start);
@@ -924,7 +874,6 @@ if ( $collector =~ /ERROR/ ){
 }
 
 SendMail($mail_report,$collector,$log);
-SendJabber($jabber_report,$collector,$log);
 
 if ( $collector =~ /ERROR/ ){
     Log("info","All tasks completed, but in the process there was an error. Work time: $time->{hour}:$time->{min}:$time->{sec}",$log);

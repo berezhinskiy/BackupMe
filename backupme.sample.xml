@@ -6,8 +6,6 @@
         <Logger type="file" path="/var/log/backupme.log" level="DEBUG"/>
         <!-- @hostname=hostname ; @date=YYYY-MM-DD -->
         <MailReport use="false" from="foo@example.com" to="bar@example.com" host="127.0.0.1" port="25" subject="[BACKUP] @host @date"/>
-        <!-- from="This JID login to jabber server" -->
-        <JabberReport use="false" host="jabber.ru" port="5222" from="backupme" to="youJID" password="backupme" />
     </General>
     <!-- Configuration archivers and support programs -->
     <Program>
