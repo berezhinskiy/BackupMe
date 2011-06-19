@@ -10,3 +10,17 @@ Features:
 - Great logging [file|syslog] system with severity level: DEBUG, INFO, WARN, ERROR, OFF
 - Checking free disk space before start backups
 - Reporting: Mail, Jabber
+
+Required perl modules:
+- Log::Log4perl 
+- XML::Simple 
+- File::Path 
+- Filesys::Df 
+- Filesys::DiskUsage 
+- Time::HiRes 
+- Sys::Syslog 
+- Sys::Hostname 
+- Mail::Sendmail 
+- Net::FTP 
+- Net::SCP::Expect 
+- Net::SSH 
