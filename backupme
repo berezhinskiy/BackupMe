@@ -1,0 +1,934 @@
+#!/usr/bin/perl
+
+#---------------------------------------------------------------------------
+# Flexible and easy backup utility.
+# It can be used to backup your file system files, directories or even to
+# backup databases.
+#
+# FEATURES:
+# ** can be used with different types of archiveres;
+# ** send backuped files using FTP or SCP protocol;
+# ** backup MySQL and PostgreSQL databases;
+# ** generate and send report via email or\and jabber.
+#
+# INSTALLATION AND USAGE:
+# Full installation and usage BackupMe instructions you can find
+# at http://backupme.org.ua
+#
+# FEEDBACK:
+# If you find any errors in the code, please send them to me
+# by mail: yaroslav@berezhinskiy.org.ua
+# Also, I hope you'll enjoy it and share with me your possitive
+# feedback to motivate me do BackupMe better !
+#---------------------------------------------------------------------------
+# $Revision: 0.1_1 $Author: Yaroslav Berezhinskiy $Date: 2010/05/21 15:24:10
+
+use strict;
+use Log::Log4perl qw(:easy);
+use XML::Simple;
+use File::Path;
+use Filesys::Df;
+use Filesys::DiskUsage qw/du/;
+use Time::HiRes qw(gettimeofday);
+use Sys::Syslog;
+use Sys::Hostname;
+use Mail::Sendmail;
+use Net::FTP;
+use Net::SCP::Expect;
+use Net::SSH qw(ssh_cmd);
+use Net::Jabber;
+use locale;
+use POSIX qw (locale_h);
+
+sub InitConfig {
+    my $config = shift;
+    my $xml;
+    $xml = new XML::Simple(KeyAttr=>[])->XMLin("$config");
+
+    my %log;
+    $log{type}=$xml->{General}->{Logger}->{type};
+    if ( $log{type} ne "file" and $log{type} ne "syslog" ){
+        print "WARN: Unknow Logger option type=\"$log{type}\" in $config Possible value: [file|syslog] Log type was set to default value: syslog\n";
+        $log{type} = "syslog";
+    }
+    $log{path}=$xml->{General}->{Logger}->{path};
+    $log{level}=$xml->{General}->{Logger}->{level};
+
+    if ( $log{level} ne "DEBUG" and $log{level} ne "INFO" and $log{level} ne "WARN" and $log{level} ne "ERROR" and $log{level} ne "OFF" ){
+        print "WARN: Unknow Logger option level=\"$log{level}\" in $config Possible value: [DEBUG|INFO|WARN|ERROR|OFF]. Log level was set to default value: DEBUG\n";
+        $log{level} = "DEBUG";
+    }
+
+    if ($log{type} eq "file" and !$log{path}){
+        print "LogFile not defined or defined incorrectly in $config! Log path was set to default value:: /var/log/backupme.log";
+        $log{path} = "/var/log/backupme.log";
+    }
+    Log("debug","\tParsed configuration file $config",\%log);
+    my %mysql_dump;
+    $mysql_dump{path} = $xml->{Program}->{MySQLDump}->{path};
+    my $mysql = GetConfigHash($xml->{Backup}->{MySQL});
+
+    my %pgsql_dump;
+    $pgsql_dump{path} = $xml->{Program}->{PostgreSQLDump}->{path};
+    my $pgsql = GetConfigHash($xml->{Backup}->{PostgreSQL});
+
+    my $archivers = GetConfigHash($xml->{Program}->{Archiver});
+    my $storages = GetConfigHash($xml->{Repositories}->{Storage});
+    my $directory = GetConfigHash($xml->{Backup}->{Directory});
+
+    my %mail_report;
+    $mail_report{use} = $xml->{General}->{MailReport}->{use};
+    if ($mail_report{use} ne "true" and $mail_report{use} ne "false"){
+        Log("warn","Unknow MailReport option use=\"$mail_report{use}\" Possible value: [true|false] Mail use was set to default value:: false",\%log);
+        $mail_report{use} = "false";
+    }
+    $mail_report{from} = $xml->{General}->{MailReport}->{from};
+
+    $mail_report{to} = $xml->{General}->{MailReport}->{to};
+    $mail_report{host} = $xml->{General}->{MailReport}->{host};
+    $mail_report{port} = $xml->{General}->{MailReport}->{port};
+    $mail_report{subject} = $xml->{General}->{MailReport}->{subject};
+
+    my %jabber_report;
+    $jabber_report{use} = $xml->{General}->{JabberReport}->{use};
+    if ($jabber_report{use} ne "true" and $jabber_report{use} ne "false"){
+        Log("warn","Unknow JabberReport option use=\"$jabber_report{use}\" Possible value: [true|false] Jabber use was set to default value: false",\%log);
+        $jabber_report{use} = "false";
+    }
+    $jabber_report{from} = $xml->{General}->{JabberReport}->{from};
+
+    $jabber_report{to} = $xml->{General}->{JabberReport}->{to};
+    $jabber_report{host} = $xml->{General}->{JabberReport}->{host};
+    $jabber_report{port} = $xml->{General}->{JabberReport}->{port};
+    $jabber_report{password} = $xml->{General}->{JabberReport}->{password};
+
+    my $temp_dir = $xml->{Repositories}->{TempDir}->{path};
+
+
+    return(\%log,\%mail_report,\%jabber_report,$archivers,$directory,$storages,$mysql,\%mysql_dump,$pgsql,\%pgsql_dump,$temp_dir);
+}
+
+sub Log {
+    my $severity = shift;
+    my $message = shift;
+    my $log = shift;
+    if ( $log->{type} eq "file" ){
+    my $log_conf = '
+        log4perl.category = '.$log->{level}.', Logfile 
+        log4perl.appender.Logfile = Log::Log4perl::Appender::File 
+        log4perl.appender.Logfile.filename = '.$log->{path}.' 
+        log4perl.appender.Logfile.layout = Log::Log4perl::Layout::PatternLayout 
+        log4perl.appender.Logfile.layout.ConversionPattern = %d{yyyy-MM-dd HH:mm:ss,SS} | %-5p | %m%n ';
+    Log::Log4perl::init( \$log_conf );
+    my $logger = Log::Log4perl::get_logger();
+    $logger->$severity("$message");
+    } elsif ( $log->{type} eq "syslog" ){
+        my $severity_log;
+        if ($severity eq "debug"){ $severity = "DEBUG"; $severity_log = "DEBUG"; }
+        elsif ($severity eq "info"){ $severity = "INFO"; $severity_log = "INFO"; }
+        elsif ($severity eq "warn"){ $severity = "WARNING"; $severity_log = "WARNING"; }
+        elsif ($severity eq "error"){ $severity = "ERR"; $severity_log = "ERROR"; }
+
+        my $mess = sprintf("%-5s %s","$severity_log"," $message");
+
+        if ( $log->{level} eq "DEBUG" and ($severity eq "DEBUG" or $severity eq "INFO" or $severity eq "ERR" or $severity eq "WARNING")){
+            openlog("backupme");
+            syslog("$severity","$mess");
+            closelog();
+        } elsif ( $log->{level} eq "INFO" and ($severity eq "INFO" or $severity eq "ERR" or $severity eq "WARNING")){
+            openlog("backupme");
+            syslog("$severity","$mess");
+            closelog();
+        } elsif ( $log->{level} eq "WARN" and ($severity eq "ERR" or $severity eq "WARNING")){
+            openlog("backupme");
+            syslog("$severity","$mess");
+            closelog();
+        } elsif ( $log->{level} eq "ERROR" and $severity eq "ERR"){
+            openlog("backupme");
+            syslog("$severity","$mess");
+            closelog();
+        }
+    }
+}
+
+sub GetConfigHash {
+    my $xml = shift;
+    my %hash;
+    my @conf = $xml;
+    my $conf0 = $conf[0];
+    if ( $conf0 =~ /ARRAY/ ){
+        foreach my $config (@$conf0){
+            my $name = $config->{name};
+            $hash{$name} = $config;
+        }
+    } elsif ( $conf0 =~ /HASH/ ) {
+        my $name = $conf0->{name};
+        $hash{$name} = $conf0;
+    } else {
+        $hash{empty} = 1;
+    }
+    return(\%hash);
+}
+
+sub GetArchiver {
+    my $directory = shift;
+    my $archiver = shift;
+    foreach  my $archiver_name (sort keys %$archiver){
+        my $archiver  = $archiver->{$archiver_name};
+        if ($directory->{archiver} eq $archiver->{name}){
+            return ($archiver);
+        }
+    }
+    return ("error");
+}
+
+sub GetStorage {
+    my $directory = shift;
+    my $storage = shift;
+    if ( $directory->{storage} =~ /\,/ ){
+        my @storages = split(',',$directory->{storage});
+    } else {
+        foreach  my $storage_name (sort keys %$storage){
+            my $storage  = $storage->{$storage_name};
+            if ($directory->{storage} eq $storage->{name}){
+                return ($storage);
+            }
+        }
+    }
+    return ("error");
+}
+
+sub CreateDir {
+    my $directory = shift;
+    my $log = shift;
+    if (! -d "$directory"){
+        if ( File::Path::make_path("$directory")){
+            Log("debug","\tNew directory created: $directory",$log);
+        } else {
+            return("error");
+        }
+    }
+    return($directory);
+}
+
+sub CheckFreeSpace {
+    my $directory = shift;
+    my $backup_dir = shift;
+    my $log = shift;
+
+    my $disk_space = df("$backup_dir",1);
+    my $size_disk_free_bytes = int($disk_space->{bavail});
+
+    my $size_directory_bytes = du( { "sector-size" => 1024 }, "$directory->{path}");
+    my $size_disk_free = GetHumanSize($size_disk_free_bytes);
+    Log("debug","\tDestinatation directory: $backup_dir Available disk space is: $size_disk_free->{size} $size_disk_free->{measure}",$log);
+    my $size_directory = GetHumanSize($size_directory_bytes);
+    Log("debug","\tSource directory: $directory->{path} Source directory size is: $size_directory->{size} $size_directory->{measure}",$log);
+    if ($size_directory_bytes > $size_disk_free_bytes) {
+        return("error");
+    }
+    my $result = "ok";
+    return($result,$size_disk_free,$size_directory); 
+}
+
+sub GetDate {
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst)=localtime(time);
+    my %date;
+    $date{year} = sprintf("%4d",$year+1900);
+    $date{month} = sprintf("%02d",$mon+1);
+    $date{day} = sprintf("%02d",$mday);
+    return(\%date);
+}
+
+sub GetHumanStorage {
+    my $storage = shift;
+    my $date = GetDate();
+    if ( $storage->{path} =~ /\@year/ || $storage->{path} =~ /\@month/ || $storage->{path} =~ /\@day/ ){
+        $storage->{path} =~ s/\@year/$date->{year}/g;
+        $storage->{path} =~ s/\@month/$date->{month}/g;
+        $storage->{path} =~ s/\@day/$date->{day}/g;
+    }
+
+    return($storage);
+}
+
+sub GetHumanTime {
+    my $seconds = shift;
+    $seconds = int($seconds);
+    my ($hour,$min,$sec);
+    if ( $seconds < 3600 ){
+        $hour = 0;
+        $min = int($seconds/60);
+        $sec = $seconds-$min*60;
+    }
+    if ( $seconds >= 3600 ) {
+        $hour = int($seconds/3600);
+        my $minsec = $seconds-$hour*3600;
+        $min = int($minsec/60);
+        $sec = $seconds-($hour*3600+$min*60);
+    }
+    $hour = sprintf("%02d", $hour);
+    $min = sprintf("%02d", $min);
+    $sec = sprintf("%02d", $sec);
+    my %time = ();
+    %time = ("hour" => "$hour", "min" => "$min", "sec" => "$sec");
+    return \%time;
+}
+
+sub GetHumanSize {
+    my $bytes = shift;
+    my %size;
+    $size{size} = $bytes;
+    $size{measure} = "bytes";
+    if ($bytes >= 1099511627776){
+        $size{size} = sprintf("%.3f",$bytes/1099511627776);
+        $size{measure} = "Tb";
+    } elsif ($bytes >= 1073741824 ){
+        $size{size} = sprintf("%.3f",$bytes/1073741824);
+        $size{measure} = "Gb";
+    } elsif ($bytes >= 1048576 ){
+        $size{size} = sprintf("%.1f",$bytes/1048576);
+        $size{measure} = "Mb";
+    } elsif ( $bytes >= 1024 ){
+        $size{size} = int($bytes/1024);
+        $size{measure} = "Kb";
+    }
+    return(\%size);
+}
+
+sub GetHumanSpeed {
+    my $size = shift;
+    my $time = shift;
+    my %speed;
+    my $speed_bps = int($size/$time);
+    $speed{speed} = $speed_bps;
+    $speed{measure} = "Bps";
+    if ($speed_bps > 1073741824 ){
+        $speed{speed} = sprintf("%.2f",$speed_bps/1073741824);
+        $speed{measure} = "Gbps";
+    } elsif ($speed_bps > 1048576 ){
+        $speed{speed} = sprintf("%.2f",$speed_bps/1048576);
+        $speed{measure} = "Mbps";
+    } elsif ($speed_bps > 1024 ){
+        $speed{speed} = int($speed_bps/1024);
+        $speed{measure} = "Kbps";
+    }
+    return(\%speed);
+}
+
+sub Archive {
+    my $directory = shift;
+    my $backup_dir = shift;
+    my $archiver = shift;
+    my $log = shift;
+    my $time_start = time();
+    Log("debug","\tExecuting: $archiver->{path} $archiver->{parameters} $backup_dir/$directory->{name}$archiver->{extension} $directory->{path}",$log);
+    my @result = `$archiver->{path} $archiver->{parameters} $backup_dir/$directory->{name}$archiver->{extension} $directory->{path} 2>&1`;
+    foreach (@result) {
+        if ( $_ =~ /error|denied|forbidden/i ){
+            Log("warn","Archiver $archiver->{name} say: $_",$log);
+        } else {
+            Log("debug","\t  Archiver $archiver->{name} say: $_",$log);
+        }
+    }
+    my $time_end = time();
+    my $time_backup = $time_end - $time_start;
+    my %file;
+    $file{path} = "$backup_dir";
+    $file{name} = "$directory->{name}";
+    $file{extension} = "$archiver->{extension}";
+    my $archive_size_bytes = int( -s "$backup_dir/$directory->{name}$archiver->{extension}" );
+    return($time_backup,\%file,$archive_size_bytes,\%file);
+}
+
+sub TransferToFTP {
+    my $file = shift;
+    my $storage = shift;
+    my $log = shift;
+
+    Log("debug","\tFTP: Connecting to ftp://$storage->{user}\@$storage->{host}:$storage->{port}",$log);
+    my ($result,$error);
+    my $ftp;
+    eval {$ftp = Net::FTP->new("$storage->{host}", Port => "$storage->{port}", Debug => 0)};
+    if ( $@ ) {
+        return("error","Cannot connect to ftp://$storage->{user}\@$storage->{host}:$storage->{port} Check you network connetcion, domain name or ftp port");
+    }
+    if ( ! $ftp->login("$storage->{user}","$storage->{password}") ){
+        $error = $ftp->message;
+        return("error","Cannot login to ftp://$storage->{user}\@$storage->{host}:$storage->{port} :: $error");
+    } else {
+        Log("debug","\tFTP: Successfully login to ftp://$storage->{user}\@$storage->{host}:$storage->{port}",$log);
+    }
+    if ( ! $ftp->mkdir("$storage->{path}", "RECURSE") ){
+        $error = $ftp->message;
+        return("error","Cannot create directory ftp://$storage->{user}\@$storage->{host}:$storage->{port}$storage->{path} :: $error");
+    } else {
+        Log("debug","\tFTP: Directory successfully created ftp://$storage->{user}\@$storage->{host}:$storage->{port}$storage->{path}",$log);
+    }
+    if ( ! $ftp->cwd("$storage->{path}") ){
+        $error = $ftp->message;
+        return("error","Cannot change directory to ftp://$storage->{user}\@$storage->{host}:$storage->{port}/$storage->{path} :: $error");
+    }
+
+    my ($size_local_bytes,$size_remote_bytes);
+    $size_local_bytes = int( -s "$file->{path}/$file->{name}$file->{extension}");
+    my $size_local = GetHumanSize($size_local_bytes);
+    Log("debug","\tFTP: Local archive size: $size_local->{size} $size_local->{measure}",$log);
+    $ftp->alloc($size_local_bytes);
+    $ftp->binary();
+    Log("debug","\tFTP: Sending file to ftp://$storage->{user}\@$storage->{host}:$storage->{port}$storage->{path}/$file->{name}$file->{extension}",$log);
+    my ($seconds_start, $microseconds_start) = gettimeofday;
+    my $time_upload_start = sprintf("%.2f","$seconds_start.$microseconds_start");
+    if ( ! $ftp->put("$file->{path}/$file->{name}$file->{extension}") ){
+        $error = $ftp->message;
+        return("error","Falied put file to ftp://$storage->{user}\@$storage->{host}:$storage->{port}$storage->{path} :: $error");
+    } else {
+        if ( ! $ftp->size("$storage->{path}/$file->{name}$file->{extension}") ){
+            $error = $ftp->message;
+            return("error","Falied get file size ftp://$storage->{user}\@$storage->{host}:$storage->{port}$storage->{path}/$file->{name}$file->{extension} :: $error");
+        } else {
+            $size_remote_bytes = $ftp->message;
+            chomp($size_remote_bytes);
+            my $size_remote = GetHumanSize($size_remote_bytes);
+            Log("debug","\tFTP: Remote archive size: $size_remote->{size} $size_remote->{measure}",$log);
+            if ( $size_local_bytes != $size_remote_bytes ) {
+                return("error","Local and remote archive sizes are not equal. Local archive size: $size_local_bytes Remote archive size: $size_remote_bytes");
+            }
+        }
+        Log("debug","\tFTP: Fule successfully sent to: ftp://$storage->{user}\@$storage->{host}:$storage->{port}$storage->{path}/$file->{name}$file->{extension}",$log);
+    }
+    my ($seconds_end, $microseconds_end) = gettimeofday;
+    my $time_upload_end = sprintf("%.2f","$seconds_end.$microseconds_end");
+    $ftp->quit;
+    my $time_upload = sprintf("%.2f",$time_upload_end - $time_upload_start);
+    my $rm = `/bin/rm $file->{path}/$file->{name}$file->{extension}`;
+    return($result,$error,$time_upload,$size_local_bytes);
+}
+
+sub TransferToSCP {
+    my $file = shift;
+    my $storage = shift;
+    my $log = shift;
+
+    my ($result,$error);
+
+    my $archive_size_bytes = int( -s "$file->{path}/$file->{name}$file->{extension}");
+    Log("debug","\tConnecting to scp://$storage->{user}\@$storage->{host}:$storage->{port} Using keyfile: $storage->{keyfile}",$log);
+
+    my ($seconds_start, $microseconds_start) = gettimeofday;
+    my $time_upload_start = sprintf("%.2f","$seconds_start.$microseconds_start");
+
+    my $user = "$storage->{user}";
+    my $host = "$storage->{host}";
+
+    eval { ssh_cmd("$user\@$host", "-p $storage->{port}", "/bin/mkdir -p $storage->{path}") };
+    if ( $@ ){
+        return("error","Cannot create new directory: ssh://$storage->{user}\@$storage->{host}:$storage->{port}$storage->{path} :: $@")
+    }
+
+    my $scp = Net::SCP::Expect->new(host=>"$storage->{host}", user=>"$storage->{user}",port => "$storage->{port}", identity_file => "$storage->{keyfile}", recursive => 1);
+    $scp->scp("$file->{path}/$file->{name}$file->{extension}","$storage->{path}/$file->{name}$file->{extension}");
+
+    my ($seconds_end, $microseconds_end) = gettimeofday;
+    my $time_upload_end = sprintf("%.2f","$seconds_end.$microseconds_end");
+
+    my $time_upload = sprintf("%.2f",$time_upload_end - $time_upload_start);
+    my $rm = `/bin/rm $file->{path}/$file->{name}$file->{extension}`;
+    return($result,$error,$time_upload,$archive_size_bytes);
+}
+
+sub MySQLDump {
+    my $mysql = shift;
+    my $mysqldump = shift;
+    my $backup_dir = shift;
+    my $log = shift;
+    Log("debug","\tExecuting: $mysqldump->{path} $mysqldump->{options} -h$mysql->{host} -u$mysql->{user} --database $mysql->{database} > $backup_dir/$mysql->{name}.sql",$log);
+    my $time_start = time();
+    my @res = `$mysqldump->{path} $mysqldump->{options} -h$mysql->{host} -P$mysql->{port} -u$mysql->{user} -p$mysql->{password} --database $mysql->{database} > $backup_dir/$mysql->{name}.sql`;
+    my $time_end = time();
+    my $time_dump_sec = $time_end - $time_start;
+    my $size_dump_bytes = du( { "sector-size" => 1024 }, "$backup_dir/$mysql->{name}.sql");
+    my %file;
+    $file{path} = "$backup_dir";
+    $file{name} = "$mysql->{name}";
+    $file{extension} = ".sql";
+    return($size_dump_bytes,$time_dump_sec,\%file);
+}
+
+sub PgSQLDump {
+    my $pgsql = shift;
+    my $pgsqldump = shift;
+    my $backup_dir = shift;
+    my $log = shift;
+    Log("debug","\tExecuting: $pgsqldump->{path} $pgsqldump->{options} -h$pgsql->{host} -u$pgsql->{user} --database $pgsql->{database} > $backup_dir/$pgsql->{name}.sql",$log);
+    my $time_start = time();
+    my @res = `$pgsqldump->{path} $pgsqldump->{options} -h $pgsql->{host} -U $pgsql->{user} -p $pgsql->{port} -W $pgsql->{password} -d $pgsql->{database} > $backup_dir/$pgsql->{name}.sql`;
+    my $time_end = time();
+    my $time_dump_sec = $time_end - $time_start;
+    my $size_dump_bytes = du( { "sector-size" => 1024 }, "$backup_dir/$pgsql->{name}.sql");
+    my %file;
+    $file{path} = "$backup_dir";
+    $file{name} = "$pgsql->{name}";
+    $file{extension} = ".sql";
+    return($size_dump_bytes,$time_dump_sec,\%file);
+}
+
+sub CollectorDirectories {
+    my ($collector_directories,$collector_type,$directory,$archiver,$storage,$size_backup_directory,$size_disk_free,$archive_size,$backup_time,$upload_time,$upload_speed,$file) = @_;
+    my $content;
+    if ($collector_type eq "error"){
+        $content = "\nERROR: $directory\n";
+        $collector_directories .= $content;
+        return($collector_directories);
+    }
+    if ($upload_time){
+    $content = <<END_OF_BODY;
+
+Backup directory:       $directory->{name} [path: $directory->{path}]
+Archiver:               $archiver->{name} [path: $archiver->{path}]
+Storage:                $storage->{name} [$storage->{type}://$storage->{host}:$storage->{port}]
+Directory size:         $size_backup_directory->{size} $size_backup_directory->{measure}
+Archive size:           $archive_size->{size} $archive_size->{measure}
+Backup time:            $backup_time->{hour}:$backup_time->{min}:$backup_time->{sec}
+Upload time:            $upload_time->{hour}:$upload_time->{min}:$upload_time->{sec}
+Upload speed:           $upload_speed->{speed} $upload_speed->{measure}
+File location:          $storage->{type}://$storage->{host}:$storage->{port}$storage->{path}/$file->{name}$file->{extension}
+END_OF_BODY
+    } else {
+    $content = <<END_OF_BODY;
+
+Backup directory:       $directory->{name} [path: $directory->{path}]
+Archiver:               $archiver->{name} [path: $archiver->{path}]
+Storage:                $storage->{name} [$storage->{path}]
+Directory size:         $size_backup_directory->{size} $size_backup_directory->{measure}
+Archive size:           $archive_size->{size} $archive_size->{measure}
+Backup time:            $backup_time->{hour}:$backup_time->{min}:$backup_time->{sec}
+File location:          $storage->{path}/$file->{name}$file->{extension}
+END_OF_BODY
+    }
+    $collector_directories .= $content;
+    return($collector_directories);
+}
+
+sub CollectorMySQL {
+    my ($collector_mysql,$collector_type,$mysql,$mysqldump,$storage,$dump_size,$dump_time,$upload_time,$upload_speed,$file) = @_;
+
+    my $content;
+    if ($upload_time){
+    $content = <<END_OF_BODY;
+
+Backup MySQL:           $mysql->{name} [database: $mysql->{database}]
+Dump program:           $mysqldump->{path}
+Storage:                $storage->{name} [$storage->{type}://$storage->{host}:$storage->{port}]
+Dump size:              $dump_size->{size} $dump_size->{measure}
+Dump time:              $dump_time->{hour}:$dump_time->{min}:$dump_time->{sec}
+Upload time:            $upload_time->{hour}:$upload_time->{min}:$upload_time->{sec}
+Upload speed:           $upload_speed->{speed} $upload_speed->{measure}
+File location:          $storage->{type}://$storage->{host}:$storage->{port}$storage->{path}/$file->{name}$file->{extension}
+END_OF_BODY
+    } else {
+    $content = <<END_OF_BODY;
+
+Backup MySQL:           $mysql->{name} [database: $mysql->{database}]
+Dump program:           $mysqldump->{path}
+Storage:                $storage->{name} [$storage->{path}]
+Dump size:              $dump_size->{size} $dump_size->{measure}
+Dump time:              $dump_time->{hour}:$dump_time->{min}:$dump_time->{sec}
+File location:          $storage->{path}/$file->{name}$file->{extension}
+END_OF_BODY
+    }
+    $collector_mysql .= $content;
+    return($collector_mysql);
+}
+
+sub CollectorPostgreSQL {
+    my ($collector_pgsql,$collector_type,$pgsql,$pgsqldump,$storage,$dump_size,$dump_time,$upload_time,$upload_speed,$file) = @_;
+
+    my $content;
+    if ($upload_time){
+    $content = <<END_OF_BODY;
+
+Backup PgSQL:           $pgsql->{name} [database: $pgsql->{databese}]
+Dump program:           $pgsqldump->{path}
+Storage:                $storage->{name} [$storage->{type}://$storage->{host}:$storage->{port}]
+Dump size:              $dump_size->{size} $dump_size->{measure}
+Dump time:              $dump_time->{hour}:$dump_time->{min}:$dump_time->{sec}
+Upload time:            $upload_time->{hour}:$upload_time->{min}:$upload_time->{sec}
+Upload speed:           $upload_speed->{speed} $upload_speed->{measure}
+File location:          $storage->{type}://$storage->{host}:$storage->{port}$storage->{path}/$file->{name}$file->{extension}
+END_OF_BODY
+    } else {
+    $content = <<END_OF_BODY;
+
+Backup PgSQL:           $pgsql->{name} [database: $pgsql->{database}]
+Dump program:           $pgsqldump->{path}
+Storage:                $storage->{name} [$storage->{path}]
+Dump size:              $dump_size->{size} $dump_size->{measure}
+Dump time:              $dump_time->{hour}:$dump_time->{min}:$dump_time->{sec}
+File location:          $storage->{path}/$file->{name}$file->{extension}
+END_OF_BODY
+    }
+    $collector_pgsql .= $content;
+    return($collector_pgsql);
+}
+
+sub SendJabber {
+    my $jabber_report = shift;
+    my $mail = shift;
+    my $log = shift;
+    if ( $jabber_report->{use} eq "false" ){
+        Log("debug","Jabber notification was not send, because JabberReport use key set to: \"$jabber_report->{use}\"",$log);
+        return;
+    }
+    Log("debug","\tSending Jabber notification",$log);
+    my $date = GetDate();
+    my $hostname = hostname;
+    my $connection = Net::Jabber::Client->new();
+
+    eval { $connection->Connect( "hostname" => "$jabber_report->{host}","port" => "$jabber_report->{port}" ) };
+    if ( $@ ){
+        Log("error","Can't connect to xmpp://$jabber_report->{host}:$jabber_report->{port} :: $@",$log);
+        return;
+    }
+
+    Log("debug","\t  Successfull connection to xmpp://$jabber_report->{host}:$jabber_report->{port}",$log);
+    my @result = $connection->AuthSend( "username" => "$jabber_report->{from}","password" => "$jabber_report->{password}","resource" => "backupme");
+    if ($result[0] ne "ok") {
+        Log("error","Ident/Auth with jabber server xmpp://$jabber_report->{host}:$jabber_report->{port} failed :: $result[1]",$log);
+        return;
+    }
+    Log("debug","\t  Successfull login to xmpp://$jabber_report->{host} with jid $jabber_report->{from}"."@"."$jabber_report->{host}",$log);
+    my $message = Net::Jabber::Message->new();
+    $message->SetMessage( "to"           => "$jabber_report->{to}"."@"."$jabber_report->{host}",
+                        "subject"      => "Backup Report",
+                        "type"         => "normal",
+                        "body"         => "Backup report for $date->{year}-$date->{month}-$date->{day} in $hostname\n\n$mail");
+    $connection->Send($message);
+    $connection->Disconnect();
+    Log("info","Jabber notification successfully sent to $jabber_report->{to}"."@"."$jabber_report->{host}",$log);
+}
+
+sub SendMail {
+    my $mail_report = shift;
+    my $collector = shift;
+    my $log = shift;
+    if ( $mail_report->{use} eq "false" ){
+        Log("debug","E-mail notification was not send, because \"MailReport use\" key set to: \"$mail_report->{use}\"",$log);
+        return;
+    }
+    Log("debug","\tSending E-mail notification",$log);
+    my %sendmail = (
+        from => "$mail_report->{to}",
+        to => "$mail_report->{from}",
+        smtp  => "$mail_report->{host}",
+        port => "$mail_report->{port}",
+        'Content-type' => 'text/plain; charset="UTF-8"');
+    my $date = GetDate();
+    if ( $mail_report->{subject} =~ /\@date/ ){
+        $mail_report->{subject} =~ s/\@date/$date->{year}-$date->{month}-$date->{day}/g;
+    }
+    my $host = hostname;
+    if ( $mail_report->{subject} =~ /\@host/ ){
+        $mail_report->{subject} =~ s/\@host/$host/g;
+    }
+    $sendmail{subject} = "$mail_report->{subject}";
+    if ( $collector =~ /ERROR/ ){
+        $sendmail{subject} = "ERROR! $mail_report->{subject}";
+    }
+    $sendmail{body} = "$collector";
+    if ( ! sendmail(%sendmail)){
+        my $error = $Mail::Sendmail::error;
+        $error =~ s/\n//g;
+        Log("error","Failed to send e-mail notification: $error",$log);
+    } else {
+        Log("info","E-mail notification successfully sent to $mail_report->{to}",$log);
+    }
+}
+
+
+sub StartBackupDirectories {
+    my ($log,$mail_report,$jabber_report,$archivers,$directories,$storages,$temp_dir) = @_;
+    if ($directories->{empty}){return;}
+    my ($collector_type,$collector_directories);
+
+    foreach my $directory_name (sort keys %$directories){
+        my $directory = $directories->{$directory_name};
+        if ($directory->{use} eq "false"){
+            Log("debug","Following directory was not backuped: name=\"$directory->{name}\" [path: $directory->{path}]. use=\"$directory->{use}\"",$log);
+            next;
+        } elsif ($directory->{use} ne "false" and $directory->{use} ne "true"){
+            Log("error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Unknow config value Directory use=\"$directory->{use}\" Possible value: [true|false]",$log);
+            $collector_directories = CollectorDirectories($collector_directories,"error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Unknow value Directory use=\"$directory->{use}\" Possible value: [true|false]");
+            next;
+        }
+
+        my $archiver = GetArchiver($directory,$archivers);
+        Log("debug","\tProcessing directory name=\"$directory->{name}\" [location: $directory->{path}]",$log);
+        if ( ! -d "$directory->{path}" ) {
+            Log("error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Path $directory->{path} not found. Skipping $directory->{name}.",$log);
+            $collector_directories = CollectorDirectories($collector_directories,"error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Path $directory->{path} not found");
+            next;
+        }
+        if ($archiver eq "error"){
+            Log("error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Archiver name=\"$directory->{archiver}\" not found",$log);
+            $collector_directories = CollectorDirectories($collector_directories,"error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Archiver name=\"$directory->{archiver}\" not found");
+            next;
+        } elsif ( ! -e $archiver->{path} or ! -x $archiver->{path} ){
+            Log("error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Archiver name=\"$archiver->{name}\" path: $archiver->{path} not found or file is not executable",$log);
+            $collector_directories = CollectorDirectories($collector_directories,"error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Archiver name=\"$archiver->{name}\" path: $archiver->{path} not found or file is not executable");
+            next;
+        }
+        Log("debug","\tArchiver program for directory name=\"$directory->{name}\" is \"$archiver->{name}\" [path: $archiver->{path}]",$log);
+        my $storage = GetStorage($directory,$storages);
+        if ($storage eq "error"){
+            Log("error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Storage name=\"$directory->{storage}\" not found",$log);
+            $collector_directories = CollectorDirectories($collector_directories,"error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Storage name=\"$directory->{storage}\" not found");
+            next;
+        }
+        $storage = GetHumanStorage($storage);
+        Log("debug","\tStorage for directory name=\"$directory->{name}\" is \"$storage->{name}\" [$storage->{path}]",$log);
+        Log("info","Starting backup directory name=\"$directory->{name}\" [$directory->{path}] with archiver name=\"$archiver->{name}\" and storage name=\"$storage->{name}\"",$log);
+        my ($backup_time,$archive_size,$upload_time,$upload_time_sec,$upload_speed,$backup_dir,$result,$error_ftp,$error_scp);
+        if ($storage->{type} eq "local"){
+            $backup_dir = CreateDir($storage->{path},$log);
+            if ($backup_dir eq "error" ){
+                 Log("error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Can't created new storage directory: $storage->{path}",$log);
+                $collector_directories = CollectorDirectories($collector_directories,"error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Can't created new storage directory: $storage->{path}");
+                next;
+            }
+        } elsif ($storage->{type} eq "ftp" or $storage->{type} eq "scp"){
+            $backup_dir = CreateDir($temp_dir,$log);
+            if ($backup_dir eq "error" ){
+                Log("error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Can't created temp directory: $temp_dir",$log);
+                $collector_directories = CollectorDirectories($collector_directories,"error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Can't created temp directory: $temp_dir");
+                next;
+            }
+        } else {
+            Log("error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Unknow storage type: $storage->{type}",$log);
+            $collector_directories = CollectorDirectories($collector_directories,"error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Unknow storage type: $storage->{type}");
+            next;
+        }
+
+        my($result,$size_disk_free,$size_backup_directory) = CheckFreeSpace($directory,$backup_dir,$log);
+        if ($result eq "error"){
+            Log("error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Size of $directory->{path}: $size_backup_directory->{size} $size_backup_directory->{measure}, but you try backup it to $backup_dir, where free space: $size_disk_free->{size} $size_disk_free->{measure}",$log);
+            $collector_directories = CollectorDirectories($collector_directories,"error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: Size of $directory->{path}: $size_backup_directory->{size} $size_backup_directory->{measure}, but you try backup it to $backup_dir, where free space: $size_disk_free->{size} $size_disk_free->{measure}");
+            next;
+        }
+
+        my ($backup_time_sec,$file,$archive_size_bytes,$file) = Archive($directory,$backup_dir,$archiver,$log);
+        if ( $storage->{type} eq "ftp" ){
+            ($result,$error_ftp,$upload_time_sec,$archive_size_bytes) = TransferToFTP($file,$storage,$log);
+            if ($result eq "error"){
+                Log("error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: $error_ftp",$log);
+                $collector_directories = CollectorDirectories($collector_directories,"error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: $error_ftp");
+                next;
+            }
+        } elsif ( $storage->{type} eq "scp" ) {
+            ($result,$error_scp,$upload_time_sec,$archive_size_bytes) = TransferToSCP($file,$storage,$log);
+            if ($result eq "error"){
+                Log("error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: $error_scp",$log);
+                $collector_directories = CollectorDirectories($collector_directories,"error","Failed to backup :: Directory name: $directory->{name} [path: $directory->{path}] :: $error_scp");
+                next;
+            }
+        }
+        $backup_time = GetHumanTime($backup_time_sec);
+        $archive_size = GetHumanSize($archive_size_bytes);
+        Log("info","Backup directory name=\"$directory->{name}\" [$directory->{path}] successfully completed:",$log);
+        Log("info","Directory size: $size_backup_directory->{size} $size_backup_directory->{measure} Archive time: $backup_time->{hour}:$backup_time->{min}:$backup_time->{sec} Archive size: $archive_size->{size} $archive_size->{measure}",$log);
+        if ($storage->{type} eq "ftp" or $storage->{type} eq "scp"){
+            $upload_time = GetHumanTime($upload_time_sec);
+            $upload_speed = GetHumanSpeed($archive_size_bytes,$upload_time_sec);
+            Log("info","Upload time: $upload_time->{hour}:$upload_time->{min}:$upload_time->{sec} Upload speed: $upload_speed->{speed} $upload_speed->{measure}",$log);
+        }
+        $collector_directories = CollectorDirectories($collector_directories,$collector_type,$directory,$archiver,$storage,$size_backup_directory,$size_disk_free,$archive_size,$backup_time,$upload_time,$upload_speed,$file);
+    }
+    return($collector_directories);
+}
+
+sub StartBackupMySQL {
+    my ($log,$mail_report,$jabber_report,$storages,$mysql,$mysqldump,$temp_dir) = @_;
+    if ($mysql->{empty}){return;}
+    my ($collector_type,$collector_mysql);
+    foreach my $mysql_name (sort keys %$mysql){
+        my $mysql = $mysql->{$mysql_name};
+
+        if ($mysql->{use} eq "false"){
+            Log("debug","Following MySQL database was not dumped: name=\"$mysql->{name}\" [database: $mysql->{database}] use=\"$mysql->{use}\"",$log);
+            next;
+        } elsif ( $mysql->{use} ne "false" and $mysql->{use} ne "true" ) {
+            Log("error","Failed to dump :: MySQL name: $mysql->{name} [database: $mysql->{database}] :: Unknow value in MySQL use=\"$mysql->{use}\" Possible value [true|false]",$log);
+            $collector_mysql = CollectorDirectories($collector_mysql,"error","Falied to dump MySQL name: $mysql->{name} [database: $mysql->{database}] :: Unknow value in MySQL use=\"$mysql->{use}\" Possible value [true|false]");
+            next;
+        }
+
+        Log("debug","\tWork with MySQL name=\"$mysql->{name}\" [DB: $mysql->{database}]",$log);
+        my $storage = GetStorage($mysql,$storages);
+        if ($storage eq "error"){
+            Log("error","Failed to dump :: MySQL name: $mysql->{name} [database: $mysql->{database}] :: Storage name=\"$mysql->{storage}\" not found",$log);
+            $collector_mysql = CollectorDirectories($collector_mysql,"error","Falied to dump :: MySQL name: $mysql->{name} [database: $mysql->{database}] :: Storage name=\"$mysql->{storage}\" not found");
+            next;
+        }
+        $storage = GetHumanStorage($storage);
+        Log("debug","\tStorage for MySQL name=\"$mysql->{name}\" is \"$storage->{name}\" [$storage->{path}]",$log);
+        Log("info","Starting dump MySQL name=\"$mysql->{name}\" [database: $mysql->{database}] with storage name=\"$storage->{name}\" [path: $storage->{path}]",$log);
+        my ($dump_time,$dump_size,$upload_time,$upload_time_sec,$upload_speed,$backup_dir,$file,$result,$error_ftp,$error_scp);
+        if ($storage->{type} eq "local"){
+            $backup_dir = CreateDir($storage->{path},$log);
+            if ($backup_dir eq "error" ){
+                Log("error","Failed to dump :: MySQL name: $mysql->{name} [database: $mysql->{database}] :: Can't created new directory: $storage->{path}",$log);
+                $collector_mysql = CollectorDirectories($collector_mysql,"error","Flied to dump :: MySQL name: $mysql->{name} [database: $mysql->{database}] :: Can't created new directory: $storage->{path}");
+                next;
+        }
+        } elsif ($storage->{type} eq "ftp" or $storage->{type} eq "scp"){
+            $backup_dir = CreateDir($temp_dir,$log);
+            if ($backup_dir eq "error" ){
+                Log("error","Failed to dump :: MySQL name: $mysql->{name} [database: $mysql->{database}] :: Can't created temp directory: $temp_dir",$log);
+                $collector_mysql = CollectorDirectories($collector_mysql,"error","Falied to dump :: MySQL name: $mysql->{name} [database: $mysql->{database}] :: Can't created temp directory: $temp_dir");
+                next;
+        }
+        }
+        my ($dump_size_bytes,$dump_time_sec,$file) = MySQLDump($mysql,$mysqldump,$backup_dir,$log);
+
+        if ( $storage->{type} eq "ftp" ){
+           ($result,$error_ftp,$upload_time_sec,$dump_size_bytes) = TransferToFTP($file,$storage,$log);
+            if ($result eq "error"){
+                Log("error","Failed to dump :: MySQL name: $mysql->{name} [database: $mysql->{database}] :: $error_ftp",$log);
+                $collector_mysql = CollectorDirectories($collector_mysql,"error","Falied to dump :: MySQL name: $mysql->{name} [database: $mysql->{database}] :: $error_ftp");
+                next;
+            }
+        } elsif ( $storage->{type} eq "scp" ) {
+            ($result,$error_scp,$upload_time_sec,$dump_size_bytes) = TransferToSCP($file,$storage,$log);
+            if ($result eq "error"){
+                Log("error","Failed to dump :: MySQL name: $mysql->{name} [database: $mysql->{database}] :: $error_scp",$log);
+                $collector_mysql = CollectorDirectories($collector_mysql,"error","Failed to dump :: MySQL name: $mysql->{name} [database: $mysql->{database}] :: $error_scp");
+                next;
+            }
+        }
+        $dump_time = GetHumanTime($dump_time_sec);
+        $dump_size = GetHumanSize($dump_size_bytes);
+        Log("info","MySQL dump name=\"$mysql->{name}\" [$mysql->{database}] successfully completed:",$log);
+        Log("info","Dump time: $dump_time->{hour}:$dump_time->{min}:$dump_time->{sec} Dump size: $dump_size->{size} $dump_size->{measure}",$log);
+        if ($storage->{type} eq "ftp" or $storage->{type} eq "scp"){
+            $upload_time = GetHumanTime($upload_time_sec);
+            $upload_speed = GetHumanSpeed($dump_size_bytes,$upload_time_sec);
+            Log("info","Upload time: $upload_time->{hour}:$upload_time->{min}:$upload_time->{sec} Upload speed: $upload_speed->{speed} $upload_speed->{measure}",$log);
+        }
+        $collector_mysql = CollectorMySQL($collector_mysql,$collector_type,$mysql,$mysqldump,$storage,$dump_size,$dump_time,$upload_time,$upload_speed,$file);
+    }
+    return($collector_mysql);
+}
+
+sub StartBackupPostgreSQL {
+    my ($log,$mail_report,$jabber_report,$storages,$pgsql,$pgsqldump,$temp_dir) = @_;
+    if ($pgsql->{empty}){return;}
+    my ($collector_type,$collector_pgsql);
+    foreach my $pgsql_name (sort keys %$pgsql){
+        my $pgsql = $pgsql->{$pgsql_name};
+
+        if ($pgsql->{use} eq "false") {
+            Log("debug","Following PostgreSQL database was not dumped: name=\"$pgsql->{name}\" [database: $pgsql->{database}] use=\"$pgsql->{use}\"",$log);
+            next;
+        } elsif ( $pgsql->{use} ne "false" and $pgsql->{use} ne "true") {
+            Log("error","Failed to dump :: PostgreSQL name: $pgsql->{name} [database: $pgsql->{database}] :: Unknow value in PostgreSQL use=\"$pgsql->{use}\" Possible value [true|false]",$log);
+            $collector_pgsql = CollectorDirectories($collector_pgsql,"error","Stop dump PostgreSQL name: $pgsql->{name} [database: $pgsql->{database}] :: Unknow value in PostgreSQL use=\"$pgsql->{use}\" Possible value [true|false]");
+            next;
+        }
+
+        Log("debug","\tWork with PostgreSQL name=\"$pgsql->{name}\" [database: $pgsql->{database}]",$log);
+        my $storage = GetStorage($pgsql,$storages);
+        if ($storage eq "error"){
+            Log("error","Failed to dump :: PostgreSQL name: $pgsql->{name} [database: $pgsql->{database}] ::Storage name=\"$pgsql->{storage}\" not found",$log);
+            $collector_pgsql = CollectorDirectories($collector_pgsql,"error","Stop dump PostgreSQL name: $pgsql->{name} [database: $pgsql->{database}] ::Storage name=\"$pgsql->{storage}\" not found");
+            next;
+        }
+        $storage = GetHumanStorage($storage);
+        Log("debug","\tStorage for PostgreSQL name=\"$pgsql->{name}\" is \"$storage->{name}\" [$storage->{path}]",$log);
+        Log("info","Starting dump PostgreSQL name: $pgsql->{name} [database: $pgsql->{database}] with storage name=\"$storage->{name}\" [$storage->{path}]",$log);
+        my ($dump_time,$dump_size,$upload_time,$upload_time_sec,$upload_speed,$backup_dir,$file,$result,$error_ftp,$error_scp);
+        if ($storage->{type} eq "local"){
+            $backup_dir = CreateDir($storage->{path},$log);
+            if ($backup_dir eq "error" ){
+                Log("error","Failed to dump :: PostgreSQL name: $pgsql->{name} [database: $pgsql->{database}] :: Can't created new directory: $storage->{path}",$log);
+                $collector_pgsql = CollectorDirectories($collector_pgsql,"error","Stop dump PostgreSQL name: $pgsql->{name} [database: $pgsql->{database}] :: Can't created new directory: $storage->{path}");
+                next;
+            }
+        } elsif ($storage->{type} eq "ftp" or $storage->{type} eq "scp"){
+            $backup_dir = CreateDir($temp_dir,$log);
+            if ($backup_dir eq "error" ){
+                Log("error","Failed to dump :: PostgreSQL name: $pgsql->{name} [database: $pgsql->{database}] :: Can't created temp directory: $temp_dir",$log);
+                $collector_pgsql = CollectorDirectories($collector_pgsql,"error","Stop dump PostgreSQL name: $pgsql->{name} [database: $pgsql->{database}] :: Can't created temp directory: $temp_dir");
+                next;
+            }
+        }
+        my ($dump_size_bytes,$dump_time_sec,$file) = PgSQLDump($pgsql,$pgsqldump,$backup_dir,$log);
+        if ( $storage->{type} eq "ftp" ){
+            ($result,$error_ftp,$upload_time_sec,$dump_size_bytes) = TransferToFTP($file,$storage,$log);
+            if ($result eq "error"){
+                Log("error","Failed to dump :: PostgreSQL name: $pgsql->{name} [database: $pgsql->{database}] :: $error_ftp",$log);
+                $collector_pgsql = CollectorDirectories($collector_pgsql,"error","Stop dump PostgreSQL name: $pgsql->{name} [database: $pgsql->{database}] :: $error_ftp");
+                next;
+            }
+        } elsif ( $storage->{type} eq "scp" ) {
+            ($result,$error_scp,$upload_time_sec,$dump_size_bytes) = TransferToSCP($file,$storage,$log);
+            if ($result eq "error"){
+                Log("error","Failed to dump :: PostgreSQL name: $pgsql->{name} [database: $pgsql->{database}] :: $error_scp",$log);
+                $collector_pgsql = CollectorDirectories($collector_pgsql,"error","Failed to dump :: PostgreSQL name: $pgsql->{name} [database: $pgsql->{database}] :: $error_scp");
+                next;
+            }
+        }
+        $dump_time = GetHumanTime($dump_time_sec);
+        $dump_size = GetHumanSize($dump_size_bytes);
+        Log("info","PgSQL dump name=\"$pgsql->{name}\" [$pgsql->{database}] successfully completed:",$log);
+        Log("info","Dump time: $dump_time->{hour}:$dump_time->{min}:$dump_time->{sec} Dump size: $dump_size->{size} $dump_size->{measure}",$log);
+        if ($storage->{type} eq "ftp" or $storage->{type} eq "scp"){
+            $upload_time = GetHumanTime($upload_time_sec);
+            $upload_speed = GetHumanSpeed($dump_size_bytes,$upload_time_sec);
+            Log("info","Upload time: $upload_time->{hour}:$upload_time->{min}:$upload_time->{sec} Upload speed: $upload_speed->{speed} $upload_speed->{measure}",$log);
+        }
+        $collector_pgsql = CollectorPostgreSQL($collector_pgsql,$collector_type,$pgsql,$pgsqldump,$storage,$dump_size,$dump_time,$upload_time,$upload_speed,$file);
+    }
+    return($collector_pgsql);
+}
+
+setlocale(LC_CTYPE, 'en_US');
+my $time_script_start = time();
+my $config;
+
+if (defined($ARGV[1]) and $ARGV[0] eq "-c"){
+    $config = $ARGV[1];
+} else {
+    if ( -f "/usr/local/etc/backupme.xml" ){
+        $config = "/usr/local/etc/backupme.xml";
+    } else {
+        print "You must run $0 -c /path/to/backupme.xml or put backupme.xml to /usr/local/etc/\n";
+        exit;
+    }
+}
+
+my ($log,$mail_report,$jabber_report,$archivers,$directories,$storages,$mysql,$mysqldump,$pgsql,$pgsqldump,$temp_dir)=InitConfig($config);
+Log("info","Start script $0 Use $config as configuration file",$log);
+
+my $collector_directories = StartBackupDirectories($log,$mail_report,$jabber_report,$archivers,$directories,$storages,$temp_dir);
+my $collector_mysql = StartBackupMySQL($log,$mail_report,$jabber_report,$storages,$mysql,$mysqldump,$temp_dir);
+my $collector_pgsql = StartBackupPostgreSQL($log,$mail_report,$jabber_report,$storages,$pgsql,$pgsqldump,$temp_dir);
+
+my $time_script_end = time();
+my $time = GetHumanTime($time_script_end - $time_script_start);
+
+my $collector = "$collector_directories $collector_mysql $collector_pgsql";
+if ( $collector =~ /ERROR/ ){
+    $collector .= "\nAll tasks completed, but in the process there was an error. Work time: $time->{hour}:$time->{min}:$time->{sec}";
+} else {
+    $collector .= "\nAll tasks successfully completed. Work time: $time->{hour}:$time->{min}:$time->{sec}";
+}
+
+SendMail($mail_report,$collector,$log);
+SendJabber($jabber_report,$collector,$log);
+
+if ( $collector =~ /ERROR/ ){
+    Log("info","All tasks completed, but in the process there was an error. Work time: $time->{hour}:$time->{min}:$time->{sec}",$log);
+} else {
+    Log("info","All tasks successfully completed. Work time: $time->{hour}:$time->{min}:$time->{sec}",$log);
+}
+Log("info","---------------------------------------------------------------------------------",$log);

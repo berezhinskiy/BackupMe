@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<Configuration>
+    <!-- Configuration logging and reporting options -->
+    <General>
+        <!-- type=[file|syslog] ; level=[DEBUG|INFO|ERROR|OFF] -->
+        <Logger type="file" path="/var/log/backupme.log" level="DEBUG"/>
+        <!-- @hostname=hostname ; @date=YYYY-MM-DD -->
+        <MailReport use="false" from="foo@example.com" to="bar@example.com" host="127.0.0.1" port="25" subject="[BACKUP] @host @date"/>
+        <!-- from="This JID login to jabber server" -->
+        <JabberReport use="false" host="jabber.ru" port="5222" from="backupme" to="youJID" password="backupme" />
+    </General>
+    <!-- Configuration archivers and support programs -->
+    <Program>
+        <Archiver name="tar" path="/usr/bin/tar" parameters="chf" extension=".tar"/>
+        <Archiver name="tgz" path="/usr/bin/tar" parameters="czhf" extension=".tar.gz"/>
+        <Archiver name="tbz" path="/usr/bin/tar" parameters="cjhf" extension=".tar.bz2"/>
+        <Archiver name="rar" path="/usr/local/bin/rar" parameters="a -m2 -idq" extension=".rar"/>
+        <Archiver name="zip" path="/usr/local/bin/zip" parameters="-rq" extension=".zip"/>
+        <Archiver name="7z" path="/usr/local/bin/7z" parameters="a -t7z" extension=".7z"/>
+        <!-- Path to mysqldump utility and custom options -->
+        <MySQLDump path="/usr/local/bin/mysqldump" options=""/>
+        <!-- Path to pg_dump utility and custom options -->
+        <PostgreSQLDump path="/usr/local/bin/pg_dump" options=""/>
+    </Program>
+    <!-- Configuration repositories for storing backup -->
+    <Repositories>
+        <!-- type=[local|ftp|scp] ; @year=YYYY ; @month=MM ; @day=DD -->
+        <Storage name="LocalFolder" type="local" path="/usr/backup/@year/@month-@day"/>
+        <Storage name="OtherLocalFolder" type="local" path="/test_backup/@year-@month-@day"/>
+        <Storage name="MyFTP" type="ftp" host="my.ftp.org" user="example" password="xxx" path="/backup/@year-@month-@day"/>
+        <Storage name="OtherFTP" type="ftp" host="other.ftp.org" user="example" password="xxx" path="/backup/@year/@month-@day"/>
+        <Storage name="MySCP" type="scp" host="192.168.0.1" user="backup" keyfile="/path/to/id_rsa" path="/home/backup/@year/@month-@day"/>
+        <!-- This path used for temporary archive storage, when copying to non-local storage -->
+        <TempDir path="/tmp"/>
+    </Repositories>
+    <!-- Configuration of directories and databases for backup -->
+    <Backup>
+        <!-- Key "name" will be used as the backup file name, "name" must be unique -->
+        <Directory name="config" use="true" path="/usr/local/etc" archiver="tgz" storage="LocalFolder"/>
+        <Directory name="etc" use="false" path="/etc" archiver="tgz" storage="OtherLocalFolder"/>
+        <Directory name="www" use="false" path="/usr/local/www" archiver="tgz" storage="OtherLocalFolder"/>
+        <MySQL name="mysql_foo" use="false" host="127.0.0.1" port="3306" user="foo" password="xxx" database="foo" storage="OtherFTP"/>
+        <MySQL name="mysql_bar" use="false" host="127.0.0.1" port="3306" user="bar" password="xxx" database="bar" storage="OtherFTP"/>
+        <PostgreSQL name="pgsql_foo" use="false" host="127.0.0.1" port="5432" user="foo" password="xxx" database="foo" storage="MySCP"/>
+        <PostgreSQL name="pgsql_bar" use="false" host="127.0.0.1" port="5432" user="bar" password="xxx" database="bar" storage="MySCP"/>
+    </Backup>
+</Configuration>
